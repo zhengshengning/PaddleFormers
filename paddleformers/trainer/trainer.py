@@ -2009,8 +2009,45 @@ class Trainer:
         self.state.consumed_samples = 0
 
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
+        
+        # 打印模型结构
+        if self.is_world_process_zero():
+            print(model, flush=True)
+
+        # === 精度对齐：注册 forward hooks ===
+        # 使用方式：设置环境变量 ENABLE_SAVE_HOOK=1 启用
+        # 设置环境变量 ENABLE_BACKWARD_HOOK=1 同时注册 backward hooks
+        # 设置环境变量 SAVE_TENSOR_GRAD=1 启用中间层梯度流追溯
+        # 设置环境变量 SAVE_TENSOR_SAVE_NPY=0 只记录 md5 日志，不保存 .npy
+        enable_backward_hook_env = os.environ.get("ENABLE_BACKWARD_HOOK", "0") == "1"
+        save_tensor_grad_env = os.environ.get("SAVE_TENSOR_GRAD", "0") == "1"  # 中间层梯度流追溯
+        if os.environ.get("ENABLE_SAVE_HOOK", "0") == "1":
+            sys.path.insert(0, "/root/paddlejob/share-storage/gpfs/system-public/ningzhengsheng/minimax-workspace")
+            from save_tensor_paddle import enable_save_hook, register_all_hooks
+
+            enable_save_hook()
+
+            # 为所有叶子模块注册 hook (layer_types=None 表示所有叶子模块)
+            self._save_hooks = register_all_hooks(
+                model,
+                layer_types=None,  # None 表示注册所有叶子模块
+                subdir="forward_hooks",
+                save_input=True,
+                save_output=True,
+                save_backward=enable_backward_hook_env,
+                save_input_grad=save_tensor_grad_env,  # 中间层输入梯度
+                save_output_grad=save_tensor_grad_env,  # 中间层输出梯度
+            )
+            logger.info(
+                "精度对齐 hooks 已注册；SAVE_TENSOR_SAVE_NPY=0 时只记录 md5 日志，不保存 .npy"
+            )
+        # === 精度对齐结束 ===
 
         tr_loss = paddle.to_tensor(0.0)
+        # 精度对齐：每个 global step 单独累加一个 loss，用于打印每步 loss 的 md5。
+        # 与 tr_loss 不同的是，这个累加器在每个 global step 边界都会被重置，
+        # 因此 md5 反映的是"本步"的 micro-batch 损失之和，方便和 MG 侧逐步对齐。
+        tr_loss_step_accum = paddle.to_tensor(0.0)
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
 
@@ -2197,8 +2234,10 @@ class Trainer:
                     if self.args.enable_auto_parallel:
                         with _exec_mode_guard("dynamic"):
                             tr_loss += tr_loss_step
+                            tr_loss_step_accum += tr_loss_step
                     else:
                         tr_loss += tr_loss_step
+                        tr_loss_step_accum += tr_loss_step
 
                     def fused_allreduce_gradients_no_sync(paramlist, hcg):
                         paramlist = list(paramlist)
@@ -2243,6 +2282,37 @@ class Trainer:
                         self._check_loss_valid(tr_loss)
 
                         self.timers and self.timers("forward-backward").stop()
+
+                        # # === 精度对齐：打印 main_grad（与 MG GRAD 对齐） ===
+                        # # PF 开启 amp_master_grad 后，反向梯度会被 MixPrecisionLayer
+                        # # 旁路到 param.main_grad 并清空 param.grad，导致 save_tensor_paddle
+                        # # 通过 param.register_hook 注册的 backward hook 无法触发。
+                        # # 在此处（all-reduce 之前）扫一遍 main_grad，与 MG 侧 param.register_hook
+                        # # 在 backward 期间打印的 per-rank 未规约梯度语义对齐。
+                        # if (
+                        #     os.environ.get("ENABLE_SAVE_HOOK", "0") == "1"
+                        #     and os.environ.get("ENABLE_BACKWARD_HOOK", "0") == "1"
+                        # ):
+                        #     try:
+                        #         import sys as _sys
+
+                        #         _sys.path.insert(
+                        #             0,
+                        #             "/root/paddlejob/share-storage/gpfs/system-public/ningzhengsheng/minimax-workspace",
+                        #         )
+                        #         from save_tensor_paddle import print_main_grad_info
+
+                        #         # 直接用 trainer 持有的 model 对象，命名前缀（_layers_X_...）
+                        #         # 与 forward hook 日志保持一致；MixPrecisionLayer 是就地
+                        #         # mutate 同一组 param，不会引入新的 wrapper 层。
+                        #         print_main_grad_info(
+                        #             model,
+                        #             stage="before_optimizer",
+                        #             microbatch_idx=self.state.global_step,
+                        #         )
+                        #     except Exception as _grad_exc:
+                        #         logger.warning(f"print_main_grad_info failed: {_grad_exc}")
+                        # # === 精度对齐结束 ===
 
                         parameters_list = None
                         if not args.enable_auto_parallel:
@@ -2326,6 +2396,57 @@ class Trainer:
                             * args.gradient_accumulation_steps
                             * args.dataset_world_size
                         )
+                        # === 精度对齐：打印每个 global step 的 loss md5 ===
+                        # 与 forward / backward / weight md5 同源（save_tensor_paddle 写到
+                        # tensor_save_rank{rank}.log），方便和 MG 侧逐步对齐。
+                        if os.environ.get("ENABLE_SAVE_HOOK", "0") == "1":
+                            try:
+                                import sys as _sys
+
+                                _sys.path.insert(
+                                    0,
+                                    "/root/paddlejob/share-storage/gpfs/system-public/ningzhengsheng/minimax-workspace",
+                                )
+                                import hashlib as _hashlib
+                                import numpy as _np
+                                from mg_pf_config import get_pf_base_dir as _get_pf_base_dir
+
+                                # 取本步累加 loss 的本地数值（per-rank、未跨 DP/PP 规约），
+                                # 与 MG 侧 per-rank 打印保持同语义。
+                                _loss_for_md5 = tr_loss_step_accum
+                                if hasattr(_loss_for_md5, "is_dist") and _loss_for_md5.is_dist():
+                                    _loss_for_md5 = _loss_for_md5._local_value()
+                                _loss_np = _loss_for_md5.detach().cast("float32").numpy()
+                                _loss_val = float(_loss_np.sum())
+                                # 与 MG 侧 md5 同源：两边都 hash 一个 fp32 标量
+                                # 的 4 字节 IEEE754 表示——bit-exact md5 ——只要
+                                # 底层数值在 fp32 下完全相同 md5 必然相等，任何
+                                # 1-ULP 差异都会让 md5 完全不同（雪崩效应）。
+                                _loss_fp32 = _np.float32(_loss_val)
+                                _loss_md5 = _hashlib.md5(
+                                    _loss_fp32.tobytes()
+                                ).hexdigest()[:16]
+                                _rank = int(dist.get_rank()) if dist.is_initialized() else 0
+                                _label = f"PF[R{_rank}] LOSS:step={self.state.global_step}"
+                                _line = (
+                                    f"| {_label:<45s} | {_loss_md5:<16s} | "
+                                    f"{'[]':<20s} | {'float32':<20s} | "
+                                    f"sum={_loss_val:.6e} |\n"
+                                )
+                                _base_dir = _get_pf_base_dir()
+                                os.makedirs(_base_dir, exist_ok=True)
+                                _log_file = os.path.join(
+                                    _base_dir, f"tensor_save_rank{_rank}.log"
+                                )
+                                with open(_log_file, "a") as _lf:
+                                    _lf.write(_line)
+                            except Exception as _loss_md5_exc:
+                                logger.warning(
+                                    f"print step loss md5 failed: {_loss_md5_exc}"
+                                )
+                        # 重置 step 累加器，准备下一步
+                        tr_loss_step_accum.subtract_(tr_loss_step_accum)
+                        # === 精度对齐结束 ===
                         # For ZCC EMA
                         if self.args.enable_zero_cost_checkpoint or self.args.zcc_save_ema_coef is not None:
                             tr_loss_for_zcc = tr_loss.clone()
@@ -3073,6 +3194,31 @@ class Trainer:
         self.create_scheduler(num_training_steps=num_training_steps)
         self.create_optimizer(self.lr_scheduler)
 
+    def _create_decay_param_fun(self, params):
+        """Create AdamW decay filter for flat parameter-list optimizers.
+
+        SFT/DPO can call ``set_optimizer_grouped_parameters`` with a flat list of
+        trainable parameters.  Preserve the usual AdamW contract in that path:
+        bias and norm parameters skip decoupled weight decay, while all other
+        optimizer-visible parameters decay.
+        """
+        if params is None or (isinstance(params, list) and params and isinstance(params[0], dict)):
+            return None
+
+        optimizer_param_ids = {id(p) for p in params}
+        decay_parameters = {
+            p.name
+            for n, p in self.model.named_parameters()
+            if id(p) in optimizer_param_ids
+            and not p.stop_gradient
+            and not any(nd in n for nd in ["bias", "norm"])
+        }
+
+        def apply_decay_param_fun(param_name):
+            return param_name in decay_parameters
+
+        return apply_decay_param_fun
+
     def create_optimizer(self, lr_scheduler=None):
         """
         Setup the optimizer.
@@ -3083,17 +3229,9 @@ class Trainer:
         if self.optimizer is None:
             if self.optimizer_grouped_parameters is not None:
                 params = self.optimizer_grouped_parameters
-                apply_decay_param_fun = None
             else:
                 params = [p for p in self.model.parameters() if not p.stop_gradient]
-                decay_parameters = [
-                    p.name
-                    for n, p in self.model.named_parameters()
-                    if not p.stop_gradient and not any(nd in n for nd in ["bias", "norm"])
-                ]
-
-                def apply_decay_param_fun(x):
-                    return x in decay_parameters
+            apply_decay_param_fun = self._create_decay_param_fun(params)
 
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
             if self.args.optim == OptimizerNames.ADAMW_CUSTOM:
